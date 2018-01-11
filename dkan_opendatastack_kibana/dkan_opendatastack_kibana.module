@@ -1,0 +1,222 @@
+<?php
+
+/**
+ * @file
+ */
+
+require_once __DIR__ . '/vendor/autoload.php';
+
+/**
+ * Implements hook_menu().
+ */
+function dkan_opendatastack_kibana_menu() {
+  $items = array();
+
+  $items['kibana'] = array(
+    'page callback' => 'dkan_opendatastack_kibana_page_callback_kibana',
+    'access callback' => TRUE,
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_node_view_alter().
+ */
+function dkan_opendatastack_kibana_node_view_alter(&$build) {
+  if ($build['#bundle'] == 'resource') {
+    // Make sure the user have the jwt cookie set.
+    dkan_opendatastack_kibana_jwt_user_cookie_save();
+
+    $node_wrapper = entity_metadata_wrapper('node', $build['#node']);
+
+    if (isset($build['field_upload'])) {
+      $build['field_upload']['#access'] = FALSE;
+    }
+
+    $markup_prefix = '<div class="kibana-container">';
+    $markup_suffix = '</div>';
+    $markup = '';
+
+    $src = variable_get('dkan_opendatastack_kibana_src', getenv('DKAN_OPENDATASTACK_KIBANA_SRC'));
+    if (!isset($src)) {
+      $markup = '<p class="kibana-body text-center">' .
+        t("Kibana backend URL missing.") .
+        '</p>';
+    }
+    else {
+      // Construct the kibana index pattern using the "dkan-<dataset uuid>-*"
+      // convention.
+      $index_pattern = null;
+
+      // Only get the uuid from the first dataset reference. Do not support n
+      // to n dataset to resource relationship.
+      if (!empty($node_wrapper->field_dataset_ref[0])) {
+        $dataset_ref = $node_wrapper->field_dataset_ref[0];
+        $index_pattern = 'dkan-' . $index_pattern . $dataset_ref->uuid->value() . '-*';
+      }
+
+      if (empty($index_pattern)) {
+        $markup = '<p class="kibana-body text-center">' .
+          t("Failed to find the associated Kibana Index Pattern.") .
+          '</p>';
+      }
+      else {
+        $src = $src . "/app/kibana#/discover?_g=(refreshInterval:(display:Off,pause:!f,value:0),time:(from:now-5y,mode:quick,to:now))&_a=(columns:!(_source),index:'" . $index_pattern . "',interval:auto,query:(language:lucene,query:''),sort:!(date,desc))";
+        $markup = '<iframe src="' .
+          $src .
+          '" class="kibana-body" width="100%" height="800" frameborder="0" allowfullscreen/>';
+      }
+    }
+
+    $build['kibana'] = array(
+      '#type' => 'markup',
+      '#markup' => $markup_prefix . $markup . $markup_suffix,
+      '#weight' => $build['field_upload']['#weight'],
+    );
+  }
+}
+
+/**
+ * Page callback for kibana menu item.
+ */
+function dkan_opendatastack_kibana_page_callback_kibana() {
+  dkan_opendatastack_kibana_jwt_user_cookie_save();
+
+  $markup_prefix = '<div class="kibana-container">';
+  $markup_suffix = '</div>';
+
+  $src = variable_get('dkan_opendatastack_kibana_src', getenv('DKAN_OPENDATASTACK_KIBANA_SRC'));
+  if (!isset($src)) {
+    $markup = '<p class="kibana-body text-center">' .
+      t("Kibana backend URL missing.") .
+      '</p>';
+  }
+  else {
+    $markup = '<iframe src="' .
+      $src .
+      '" class="kibana-body" width="100%" height="800" frameborder="0" allowfullscreen/>';
+  }
+
+  $page['kibana'] = array(
+    '#type' => 'markup',
+    '#markup' => $markup_prefix . $markup . $markup_suffix,
+  );
+
+  return $page;
+}
+
+/**
+ * Implements hook_user_login().
+ *
+ * Make sure we have a fresh token on user login.
+ */
+function dkan_opendatastack_kibana_user_login(&$edit, $account) {
+  user_cookie_delete('jwt');
+}
+
+/**
+ * Implements hook_user_logout().
+ */
+function dkan_opendatastack_kibana_user_logout($account) {
+  user_cookie_delete('jwt');
+}
+
+/**
+ * Add JWT as a cookie to anonymous and registered users.
+ */
+function dkan_opendatastack_kibana_jwt_user_cookie_save() {
+  // Check if a user is logged in.
+  if (empty($_COOKIE['Drupal_visitor_jwt'])) {
+    if (!user_is_logged_in()) {
+      $ssid = session_id();
+
+      // Anonymous, start a session if not done already.
+      if (empty($ssid)) {
+        drupal_session_start();
+        $_SESSION['nosave'] = TRUE;
+        $ssid = session_id();
+      }
+
+      // We have a session, make sure the cookie is there.
+      $claims = dkan_opendatastack_kibana_jwt_claims('anonymous', $ssid);
+      $token = dkan_opendatastack_kibana_generate_jwt($claims);
+      user_cookie_save(array(
+        'jwt' => $token,
+      ));
+    }
+    else {
+      global $user;
+
+      $token = dkan_opendatastack_kibana_generate_jwt_from_account($user);
+
+      user_cookie_save(array(
+        'jwt' => $token,
+      ));
+    }
+  }
+}
+
+/**
+ * Generate JWT claims array from arguments.
+ */
+function dkan_opendatastack_kibana_jwt_claims($username, $id) {
+  // Elasticsearch >= 6.0 wont accept indexs with uppercase chars.
+  return array(
+    'x-proxy-user' => $username . '_' . strtolower($id),
+  );
+}
+
+/**
+ * Generate JWT from generic claims.
+ */
+function dkan_opendatastack_kibana_generate_jwt(array $claims) {
+  $siging_key = variable_get('dkan_opendatastack_kibana_jwt_secret', getenv('DKAN_OPENDATASTACK_KIBANA_JWT_SECRET'));
+  $issuer = variable_get('dkan_opendatastack_kibana_jwt_issuer', 'dkan_opendatastack_kibana');
+
+  try {
+    if (!class_exists('Lcobucci\JWT\Builder')) {
+      throw new Exception('Missing Composer dependencies, check admin/config/system/composer-manager/packages');
+    }
+    elseif (!isset($siging_key)) {
+      throw new Exception('Missing secret used to sign the token.');
+    }
+
+    $signer = new Lcobucci\JWT\Signer\Hmac\Sha256();
+
+    // Configures the issuer (iss claim)
+    $jwtBuilder = new Lcobucci\JWT\Builder();
+    $jwtBuilder->setIssuer($issuer)
+    // Configures the time that the token was issue (iat claim)
+      ->setIssuedAt(time())
+    // Configures the time that the token can be used (nbf claim)
+      ->setNotBefore(time() + 60)
+    // Configures the expiration time of the token (exp claim)
+      ->setExpiration(time() + 3600);
+
+    foreach ($claims as $claim_key => $claim_value) {
+      // Configures a new claim, called "uid".
+      $jwtBuilder->set($claim_key, $claim_value);
+    }
+
+    // Creates a signature using "testing" as key.
+    $jwtBuilder->sign($signer, $siging_key);
+
+    // Retrieves the generated token.
+    $token = $jwtBuilder->getToken();
+
+    return $token;
+  }
+  catch (Exception $e) {
+    // Undefined exception.
+    watchdog_exception('dkan_opendatastack_kibana', $e);
+  }
+}
+
+/**
+ * Generate JWT from Drupal account fields.
+ */
+function dkan_opendatastack_kibana_generate_jwt_from_account($account) {
+  $claims = dkan_opendatastack_kibana_jwt_claims($account->name, $account->uid);
+  return dkan_opendatastack_kibana_generate_jwt($claims);
+}

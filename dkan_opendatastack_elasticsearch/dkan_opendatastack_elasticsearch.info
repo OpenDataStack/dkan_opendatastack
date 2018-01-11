@@ -1,0 +1,4 @@
+core = "7.x"
+description = "Dkan OpenDataStack module."
+name = "Dkan OpenDataStack module"
+dependencies[] = jsonb
