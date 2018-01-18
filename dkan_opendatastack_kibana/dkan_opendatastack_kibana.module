@@ -24,14 +24,19 @@ function dkan_opendatastack_kibana_menu() {
  * Implements hook_node_view_alter().
  */
 function dkan_opendatastack_kibana_node_view_alter(&$build) {
-  if ($build['#bundle'] == 'resource') {
+  $uri = _dkan_opendatastack_elasticsearch_get_resource_uri($build['#node']);
+  $allowed_extensions = _dkan_opendatastack_elasticsearch_allowed_extensions($uri, array('csv'));
+  $dataset_nid = (int)$build['#node']->field_dataset_ref[LANGUAGE_NONE][0]['target_id'];
+  $dataset_node = node_load($dataset_nid);
+
+  if ($build['#bundle'] == 'resource' && $allowed_extensions && !empty($dataset_node->field_elastic_schema[LANGUAGE_NONE][0]['value'])) {
     // Make sure the user have the jwt cookie set.
     dkan_opendatastack_kibana_jwt_user_cookie_save();
 
     $node_wrapper = entity_metadata_wrapper('node', $build['#node']);
 
     if (isset($build['field_upload'])) {
-      $build['field_upload']['#access'] = FALSE;
+        $build['field_upload']['#access'] = FALSE;
     }
 
     $markup_prefix = '<div class="kibana-container">';
@@ -47,7 +52,7 @@ function dkan_opendatastack_kibana_node_view_alter(&$build) {
     else {
       // Construct the kibana index pattern using the "dkan-<dataset uuid>-*"
       // convention.
-      $index_pattern = null;
+      $index_pattern = NULL;
 
       // Only get the uuid from the first dataset reference. Do not support n
       // to n dataset to resource relationship.
@@ -58,8 +63,8 @@ function dkan_opendatastack_kibana_node_view_alter(&$build) {
 
       if (empty($index_pattern)) {
         $markup = '<p class="kibana-body text-center">' .
-          t("Failed to find the associated Kibana Index Pattern.") .
-          '</p>';
+            t("Failed to find the associated Kibana Index Pattern.") .
+            '</p>';
       }
       else {
         $src = $src . "/app/kibana#/discover?_g=(refreshInterval:(display:Off,pause:!f,value:0),time:(from:now-5y,mode:quick,to:now))&_a=(columns:!(_source),index:'" . $index_pattern . "',interval:auto,query:(language:lucene,query:''),sort:!(date,desc))";
